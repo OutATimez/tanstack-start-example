@@ -109,3 +109,22 @@ jobs:
 
           echo "❌ Health check failed"
           exit 1
+
+      # Cleanup only for NEW deployments that failed
+      - name: Cleanup failed new deployment
+        if: failure() && steps.check.outputs.is_new == 'true'
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          echo "🧹 Cleaning up failed new deployment..."
+          kubectl delete namespace $APP_NAME --ignore-not-found=true
+          echo "Namespace $APP_NAME deleted"
+
+      # Rollback for EXISTING deployments that failed
+      - name: Rollback failed update
+        if: failure() && steps.check.outputs.is_new == 'false'
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          echo "⏪ Rolling back failed update..."
+          kubectl rollout undo deployment/$APP_NAME -n $APP_NAME
+          kubectl rollout status deployment/$APP_NAME -n $APP_NAME --timeout=120s
+          echo "Rollback complete"
