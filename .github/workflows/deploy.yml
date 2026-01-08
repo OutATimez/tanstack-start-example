@@ -20,9 +20,11 @@ jobs:
       url: https://${{ steps.vars.outputs.app_name }}.outatime.live
 
     steps:
-      - uses: actions/checkout@v4
+      # ==================== SETUP ====================
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
 
-      - name: Set variables
+      - name: 🔧 Set variables
         id: vars
         run: |
           REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
@@ -30,49 +32,121 @@ jobs:
           echo "image=${{ env.REGISTRY }}/${REPO_LOWER}" >> $GITHUB_OUTPUT
           echo "app_name=${APP_NAME}" >> $GITHUB_OUTPUT
 
-      - name: Login to GitHub Container Registry
+      # ==================== BUILD ====================
+      - name: 🔐 Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: 🐳 Build Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
-          tags: |
-            ${{ steps.vars.outputs.image }}:${{ github.sha }}
-            ${{ steps.vars.outputs.image }}:latest
+          push: false
+          load: true
+          tags: ${{ steps.vars.outputs.image }}:${{ github.sha }}
 
-      - name: Set up kubectl
+      - name: 📤 Push Docker image
+        run: |
+          docker push ${{ steps.vars.outputs.image }}:${{ github.sha }}
+          docker tag ${{ steps.vars.outputs.image }}:${{ github.sha }} ${{ steps.vars.outputs.image }}:latest
+          docker push ${{ steps.vars.outputs.image }}:latest
+
+      # ==================== DEPLOY SETUP ====================
+      - name: 🛠️ Set up kubectl
         uses: azure/setup-kubectl@v3
 
-      - name: Deploy to cluster
+      - name: 🔑 Configure kubectl
         run: |
           mkdir -p ~/.kube
           echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
 
+      - name: 🔍 Check if new deployment
+        id: check
+        run: |
           APP_NAME="${{ steps.vars.outputs.app_name }}"
-          IMAGE="${{ steps.vars.outputs.image }}:${{ github.sha }}"
+          if kubectl get deployment $APP_NAME -n $APP_NAME &> /dev/null; then
+            echo "is_new=false" >> $GITHUB_OUTPUT
+            echo "✅ Existing deployment found - will rollback on failure"
+          else
+            echo "is_new=true" >> $GITHUB_OUTPUT
+            echo "🆕 New deployment - will cleanup on failure"
+          fi
 
+      # ==================== NAMESPACE ====================
+      - name: 📁 Create namespace
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
           kubectl create namespace $APP_NAME --dry-run=client -o yaml | kubectl apply -f -
 
-          for i in {1..6}; do
-            kubectl get secret ghcr-org-secret -n $APP_NAME && break
-            echo "Waiting for pull secret..."
+      - name: ⏳ Wait for pull secret
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          for i in {1..12}; do
+            if kubectl get secret ghcr-org-secret -n $APP_NAME &> /dev/null; then
+              echo "✅ Pull secret available"
+              exit 0
+            fi
+            echo "Waiting for pull secret... (attempt $i/12)"
             sleep 5
           done
+          echo "❌ Pull secret not found"
+          exit 1
+
+      # ==================== APPLY MANIFESTS ====================
+      - name: 📝 Prepare manifests
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          IMAGE="${{ steps.vars.outputs.image }}:${{ github.sha }}"
 
           sed -i "s|{{APP_NAME}}|$APP_NAME|g" k8s/*.yaml
           sed -i "s|{{IMAGE}}|$IMAGE|g" k8s/*.yaml
           sed -i "s|{{DOMAIN}}|$APP_NAME.outatime.live|g" k8s/*.yaml
 
-          kubectl apply -f k8s/ -n $APP_NAME
+          echo "### Prepared Manifests" >> $GITHUB_STEP_SUMMARY
+          echo '```yaml' >> $GITHUB_STEP_SUMMARY
+          cat k8s/deployment.yaml >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: 🚀 Apply deployment
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          kubectl apply -f k8s/deployment.yaml -n $APP_NAME
+
+      - name: 🌐 Apply service
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          kubectl apply -f k8s/service.yaml -n $APP_NAME
+
+      - name: 🔗 Apply ingress
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          kubectl apply -f k8s/ingress.yaml -n $APP_NAME
+
+      - name: ⏳ Wait for rollout
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
           kubectl rollout status deployment/$APP_NAME -n $APP_NAME --timeout=120s
 
-      - name: Verify deployment
+      # ==================== VERIFY ====================
+      - name: 📊 Get pod status
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          kubectl get pods -n $APP_NAME -o wide
+
+      - name: 📊 Get service status
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          kubectl get svc -n $APP_NAME
+
+      - name: 📊 Get ingress status
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          kubectl get ingress -n $APP_NAME
+
+      - name: 📋 Deployment summary
         run: |
           APP_NAME="${{ steps.vars.outputs.app_name }}"
 
@@ -90,12 +164,12 @@ jobs:
 
           echo "| URL | https://$APP_NAME.outatime.live |" >> $GITHUB_STEP_SUMMARY
 
-      - name: Health check
+      - name: 🏥 Health check
         run: |
           APP_NAME="${{ steps.vars.outputs.app_name }}"
           URL="https://$APP_NAME.outatime.live"
 
-          echo "Waiting for $URL to be ready..."
+          echo "Checking $URL ..."
 
           for i in {1..30}; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" $URL || echo "000")
@@ -103,28 +177,27 @@ jobs:
               echo "✅ App is live at $URL"
               exit 0
             fi
-            echo "Attempt $i: Status $STATUS, retrying..."
+            echo "Attempt $i/30: Status $STATUS"
             sleep 10
           done
 
           echo "❌ Health check failed"
           exit 1
 
-      # Cleanup only for NEW deployments that failed
-      - name: Cleanup failed new deployment
+      # ==================== CLEANUP ON FAILURE ====================
+      - name: 🧹 Cleanup failed new deployment
         if: failure() && steps.check.outputs.is_new == 'true'
         run: |
           APP_NAME="${{ steps.vars.outputs.app_name }}"
-          echo "🧹 Cleaning up failed new deployment..."
+          echo "Cleaning up failed new deployment..."
           kubectl delete namespace $APP_NAME --ignore-not-found=true
-          echo "Namespace $APP_NAME deleted"
+          echo "✅ Namespace $APP_NAME deleted"
 
-      # Rollback for EXISTING deployments that failed
-      - name: Rollback failed update
+      - name: ⏪ Rollback failed update
         if: failure() && steps.check.outputs.is_new == 'false'
         run: |
           APP_NAME="${{ steps.vars.outputs.app_name }}"
-          echo "⏪ Rolling back failed update..."
+          echo "Rolling back failed update..."
           kubectl rollout undo deployment/$APP_NAME -n $APP_NAME
           kubectl rollout status deployment/$APP_NAME -n $APP_NAME --timeout=120s
-          echo "Rollback complete"
+          echo "✅ Rollback complete"
