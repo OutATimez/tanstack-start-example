@@ -1,0 +1,91 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      deployments: write # Add this!
+
+    environment: # Add this block!
+      name: production
+      url: https://${{ steps.repo.outputs.name }}.outatime.live
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract repo name
+        id: repo
+        run: echo "name=$(basename ${{ github.repository }})" >> $GITHUB_OUTPUT
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Deploy to cluster
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+
+          APP_NAME="${{ steps.repo.outputs.name }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+
+          kubectl create namespace $APP_NAME --dry-run=client -o yaml | kubectl apply -f -
+
+          for i in {1..6}; do
+            kubectl get secret ghcr-org-secret -n $APP_NAME && break
+            echo "Waiting for pull secret..."
+            sleep 5
+          done
+
+          sed -i "s|{{APP_NAME}}|$APP_NAME|g" k8s/*.yaml
+          sed -i "s|{{IMAGE}}|$IMAGE|g" k8s/*.yaml
+          sed -i "s|{{DOMAIN}}|$APP_NAME.outatime.live|g" k8s/*.yaml
+
+          kubectl apply -f k8s/ -n $APP_NAME
+          kubectl rollout status deployment/$APP_NAME -n $APP_NAME --timeout=120s
+
+      - name: Verify deployment
+        run: |
+          APP_NAME="${{ steps.repo.outputs.name }}"
+
+          echo "### Deployment Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          # Get pod status
+          PODS=$(kubectl get pods -n $APP_NAME -o jsonpath='{.items[*].status.phase}')
+          echo "| Pods | $PODS |" >> $GITHUB_STEP_SUMMARY
+
+          # Get replica count
+          READY=$(kubectl get deployment $APP_NAME -n $APP_NAME -o jsonpath='{.status.readyReplicas}')
+          DESIRED=$(kubectl get deployment $APP_NAME -n $APP_NAME -o jsonpath='{.spec.replicas}')
+          echo "| Replicas | $READY/$DESIRED |" >> $GITHUB_STEP_SUMMARY
+
+          # Get URL
+          echo "| URL | https://$APP_NAME.outatime.live |" >> $GITHUB_STEP_SUMMARY
