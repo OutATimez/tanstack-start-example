@@ -6,7 +6,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-deploy:
@@ -14,18 +13,22 @@ jobs:
     permissions:
       contents: read
       packages: write
-      deployments: write # Add this!
+      deployments: write
 
-    environment: # Add this block!
+    environment:
       name: production
-      url: https://${{ steps.repo.outputs.name }}.outatime.live
+      url: https://${{ steps.vars.outputs.app_name }}.outatime.live
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract repo name
-        id: repo
-        run: echo "name=$(basename ${{ github.repository }})" >> $GITHUB_OUTPUT
+      - name: Set variables
+        id: vars
+        run: |
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          APP_NAME=$(basename "$REPO_LOWER")
+          echo "image=${{ env.REGISTRY }}/${REPO_LOWER}" >> $GITHUB_OUTPUT
+          echo "app_name=${APP_NAME}" >> $GITHUB_OUTPUT
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -40,8 +43,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ steps.vars.outputs.image }}:${{ github.sha }}
+            ${{ steps.vars.outputs.image }}:latest
 
       - name: Set up kubectl
         uses: azure/setup-kubectl@v3
@@ -51,8 +54,8 @@ jobs:
           mkdir -p ~/.kube
           echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
 
-          APP_NAME="${{ steps.repo.outputs.name }}"
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          IMAGE="${{ steps.vars.outputs.image }}:${{ github.sha }}"
 
           kubectl create namespace $APP_NAME --dry-run=client -o yaml | kubectl apply -f -
 
@@ -71,21 +74,38 @@ jobs:
 
       - name: Verify deployment
         run: |
-          APP_NAME="${{ steps.repo.outputs.name }}"
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
 
           echo "### Deployment Status" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Resource | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
 
-          # Get pod status
           PODS=$(kubectl get pods -n $APP_NAME -o jsonpath='{.items[*].status.phase}')
           echo "| Pods | $PODS |" >> $GITHUB_STEP_SUMMARY
 
-          # Get replica count
           READY=$(kubectl get deployment $APP_NAME -n $APP_NAME -o jsonpath='{.status.readyReplicas}')
           DESIRED=$(kubectl get deployment $APP_NAME -n $APP_NAME -o jsonpath='{.spec.replicas}')
           echo "| Replicas | $READY/$DESIRED |" >> $GITHUB_STEP_SUMMARY
 
-          # Get URL
           echo "| URL | https://$APP_NAME.outatime.live |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Health check
+        run: |
+          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          URL="https://$APP_NAME.outatime.live"
+
+          echo "Waiting for $URL to be ready..."
+
+          for i in {1..30}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" $URL || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ App is live at $URL"
+              exit 0
+            fi
+            echo "Attempt $i: Status $STATUS, retrying..."
+            sleep 10
+          done
+
+          echo "❌ Health check failed"
+          exit 1
