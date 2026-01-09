@@ -8,8 +8,8 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
+  build-image:
+    runs-on: ubuntu-slim
     permissions:
       contents: read
       packages: write
@@ -54,6 +54,19 @@ jobs:
           docker tag ${{ steps.vars.outputs.image }}:${{ github.sha }} ${{ steps.vars.outputs.image }}:latest
           docker push ${{ steps.vars.outputs.image }}:latest
 
+  prepare-cluster:
+    needs: build-image
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      packages: write
+      deployments: write
+
+    environment:
+      name: production
+      url: https://${{ steps.vars.outputs.app_name }}.outatime.live
+
+    steps:
       # ==================== DEPLOY SETUP ====================
       - name: 🛠️ Set up kubectl
         uses: azure/setup-kubectl@v3
@@ -95,6 +108,19 @@ jobs:
           echo "❌ Pull secret not found"
           exit 1
 
+  deployment:
+    needs: prepare-cluster
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      packages: write
+      deployments: write
+
+    environment:
+      name: production
+      url: https://${{ steps.vars.outputs.app_name }}.outatime.live
+
+    steps:
       # ==================== APPLY MANIFESTS ====================
       - name: 📝 Prepare manifests
         run: |
@@ -164,6 +190,19 @@ jobs:
 
           echo "| URL | https://$APP_NAME.outatime.live |" >> $GITHUB_STEP_SUMMARY
 
+  health-check:
+    needs: deployment
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      packages: write
+      deployments: write
+
+    environment:
+      name: production
+      url: https://${{ steps.vars.outputs.app_name }}.outatime.live
+
+    steps:
       - name: 🏥 Health check
         run: |
           APP_NAME="${{ steps.vars.outputs.app_name }}"
@@ -184,6 +223,19 @@ jobs:
           echo "❌ Health check failed"
           exit 1
 
+  clean-up:
+    needs: build-image
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      packages: write
+      deployments: write
+
+    environment:
+      name: production
+      url: https://${{ steps.vars.outputs.app_name }}.outatime.live
+
+    steps:
       # ==================== CLEANUP ON FAILURE ====================
       - name: 🧹 Cleanup failed new deployment
         if: failure() && steps.check.outputs.is_new == 'true'
