@@ -10,6 +10,9 @@ env:
 jobs:
   build-image:
     runs-on: ubuntu-slim
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      app_name: ${{ steps.vars.outputs.app_name }}
     permissions:
       contents: read
       packages: write
@@ -57,6 +60,8 @@ jobs:
   prepare-cluster:
     needs: build-image
     runs-on: ubuntu-slim
+    outputs:
+      is_new: ${{ steps.check.outputs.is_new }}
     permissions:
       contents: read
       packages: write
@@ -64,7 +69,7 @@ jobs:
 
     environment:
       name: production
-      url: https://${{ steps.vars.outputs.app_name }}.outatime.live
+      url: https://${{ needs.build-image.outputs.app_name }}.outatime.live
 
     steps:
       # ==================== DEPLOY SETUP ====================
@@ -79,7 +84,7 @@ jobs:
       - name: 🔍 Check if new deployment
         id: check
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           if kubectl get deployment $APP_NAME -n $APP_NAME &> /dev/null; then
             echo "is_new=false" >> $GITHUB_OUTPUT
             echo "✅ Existing deployment found - will rollback on failure"
@@ -91,12 +96,12 @@ jobs:
       # ==================== NAMESPACE ====================
       - name: 📁 Create namespace
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           kubectl create namespace $APP_NAME --dry-run=client -o yaml | kubectl apply -f -
 
       - name: ⏳ Wait for pull secret
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           for i in {1..12}; do
             if kubectl get secret ghcr-org-secret -n $APP_NAME &> /dev/null; then
               echo "✅ Pull secret available"
@@ -109,7 +114,7 @@ jobs:
           exit 1
 
   deployment:
-    needs: prepare-cluster
+    needs: [build-image, prepare-cluster]
     runs-on: ubuntu-slim
     permissions:
       contents: read
@@ -118,14 +123,25 @@ jobs:
 
     environment:
       name: production
-      url: https://${{ steps.vars.outputs.app_name }}.outatime.live
+      url: https://${{ needs.build-image.outputs.app_name }}.outatime.live
 
     steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🛠️ Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: 🔑 Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+
       # ==================== APPLY MANIFESTS ====================
       - name: 📝 Prepare manifests
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
-          IMAGE="${{ steps.vars.outputs.image }}:${{ github.sha }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
+          IMAGE="${{ needs.build-image.outputs.image }}:${{ github.sha }}"
 
           sed -i "s|{{APP_NAME}}|$APP_NAME|g" k8s/*.yaml
           sed -i "s|{{IMAGE}}|$IMAGE|g" k8s/*.yaml
@@ -138,43 +154,43 @@ jobs:
 
       - name: 🚀 Apply deployment
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           kubectl apply -f k8s/deployment.yaml -n $APP_NAME
 
       - name: 🌐 Apply service
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           kubectl apply -f k8s/service.yaml -n $APP_NAME
 
       - name: 🔗 Apply ingress
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           kubectl apply -f k8s/ingress.yaml -n $APP_NAME
 
       - name: ⏳ Wait for rollout
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           kubectl rollout status deployment/$APP_NAME -n $APP_NAME --timeout=120s
 
       # ==================== VERIFY ====================
       - name: 📊 Get pod status
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           kubectl get pods -n $APP_NAME -o wide
 
       - name: 📊 Get service status
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           kubectl get svc -n $APP_NAME
 
       - name: 📊 Get ingress status
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           kubectl get ingress -n $APP_NAME
 
       - name: 📋 Deployment summary
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
 
           echo "### Deployment Status" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -191,7 +207,7 @@ jobs:
           echo "| URL | https://$APP_NAME.outatime.live |" >> $GITHUB_STEP_SUMMARY
 
   health-check:
-    needs: deployment
+    needs: [build-image, prepare-cluster, deployment]
     runs-on: ubuntu-slim
     permissions:
       contents: read
@@ -200,12 +216,12 @@ jobs:
 
     environment:
       name: production
-      url: https://${{ steps.vars.outputs.app_name }}.outatime.live
+      url: https://${{ needs.build-image.outputs.app_name }}.outatime.live
 
     steps:
       - name: 🏥 Health check
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           URL="https://$APP_NAME.outatime.live"
 
           echo "Checking $URL ..."
@@ -224,7 +240,8 @@ jobs:
           exit 1
 
   clean-up:
-    needs: build-image
+    needs: [build-image, prepare-cluster, deployment, health-check]
+    if: failure()
     runs-on: ubuntu-slim
     permissions:
       contents: read
@@ -233,22 +250,30 @@ jobs:
 
     environment:
       name: production
-      url: https://${{ steps.vars.outputs.app_name }}.outatime.live
+      url: https://${{ needs.build-image.outputs.app_name }}.outatime.live
 
     steps:
+      - name: 🛠️ Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: 🔑 Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+
       # ==================== CLEANUP ON FAILURE ====================
       - name: 🧹 Cleanup failed new deployment
-        if: failure() && steps.check.outputs.is_new == 'true'
+        if: needs.prepare-cluster.outputs.is_new == 'true'
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           echo "Cleaning up failed new deployment..."
           kubectl delete namespace $APP_NAME --ignore-not-found=true
           echo "✅ Namespace $APP_NAME deleted"
 
       - name: ⏪ Rollback failed update
-        if: failure() && steps.check.outputs.is_new == 'false'
+        if: needs.prepare-cluster.outputs.is_new == 'false'
         run: |
-          APP_NAME="${{ steps.vars.outputs.app_name }}"
+          APP_NAME="${{ needs.build-image.outputs.app_name }}"
           echo "Rolling back failed update..."
           kubectl rollout undo deployment/$APP_NAME -n $APP_NAME
           kubectl rollout status deployment/$APP_NAME -n $APP_NAME --timeout=120s
